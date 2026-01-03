@@ -2,7 +2,10 @@
 
 First, you need to fill in the .env with the path to your images.
 
-Then, run the main.py.
+Once you have done that, you just need to run main.py.
+
+# Demonstration
+![q-boxing](https://github.com/user-attachments/assets/a02d08ef-d35c-4eb8-b0ec-154f772226e2)
 
 ## What do the fighters do? ##
 - They move around the map trying to get close to each other.
