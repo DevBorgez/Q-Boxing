@@ -1,6 +1,6 @@
 # Q-Boxing - A boxing fight with Q-Learning
 
-First, you need to fill in the .env with the path to your images.
+* Update the .env file with the local path to your images.
 
 Once you have done that, you just need to run main.py.
 
