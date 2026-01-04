@@ -12,11 +12,23 @@ from fx.decals import GroundDecal
 
 
 class Character:
-    def __init__(self, cfg, x, y, color, arm_color, name,
-                 head_image, ko_image,
-                 impacts, snd_light, snd_mid, snd_heavy,
-                 glove_left_img, glove_right_img):
-
+    def __init__(
+        self,
+        cfg,
+        x,
+        y,
+        color,
+        arm_color,
+        name,
+        head_image,
+        ko_image,
+        impacts,
+        snd_light,
+        snd_mid,
+        snd_heavy,
+        glove_left_img,
+        glove_right_img,
+    ):
         self.cfg = cfg
         self.name = name
         self.color = color
@@ -48,6 +60,10 @@ class Character:
         self.punch_timer_left = 0
         self.punch_timer_right = 0
         self.punch_cd = 0
+
+        # arm lock (used by "same side" vulnerability / counter)
+        self.arm_lock_left = 0
+        self.arm_lock_right = 0
 
         # dodge
         self.dodge_cd = 0
@@ -85,9 +101,14 @@ class Character:
         self.glove_left_img = glove_left_img
         self.glove_right_img = glove_right_img
 
-        # cache
-        self._glove_cache: Dict[Tuple[int, int], pygame.Surface] = {}
+        self.counter_window = 0
 
+        # cache: rotated surfaces keyed by (id(surface), quant_angle_deg)
+        self._rot_cache: Dict[Tuple[int, int], pygame.Surface] = {}
+
+    # ============================================================
+    # State
+    # ============================================================
     def _calc_n_states(self) -> int:
         c = self.cfg
         base = (c.DIST_BINS * c.DXDY_BINS * c.ENERGY_BINS * c.ENERGY_BINS * c.CD_BINS * c.TIME_BINS)
@@ -135,8 +156,11 @@ class Character:
 
         punch_ready = 1 if self.punch_cd == 0 else 0
         dodge_ready = 1 if self.dodge_cd == 0 else 0
+        counter_ready = 1 if self.counter_window > 0 else 0
         low_energy = 1 if self.energy < 18 else 0
-        b = (punch_ready << 2) | (dodge_ready << 1) | (low_energy << 0)
+        any_arm_locked = 1 if (self.arm_lock_left > 0 or self.arm_lock_right > 0) else 0
+
+        b = (punch_ready << 4) | (dodge_ready << 3) | (counter_ready << 2) | (low_energy << 1) | (any_arm_locked << 0)
 
         idx = dist_bin
         idx = idx * c.DXDY_BINS + dxdy_bin
@@ -147,6 +171,9 @@ class Character:
         idx = idx * (2 ** c.BOOL_BITS) + b
         return int(idx)
 
+    # ============================================================
+    # Q-learning helpers
+    # ============================================================
     def choose_action(self, state_idx: int) -> int:
         if random.random() < self.epsilon:
             return random.randint(0, len(self.cfg.ACTIONS) - 1)
@@ -155,6 +182,9 @@ class Character:
     def decay_epsilon(self):
         self.epsilon = max(self.cfg.EPSILON_MIN, self.epsilon * self.cfg.EPSILON_DECAY)
 
+    # ============================================================
+    # Movement / Timers
+    # ============================================================
     def update_facing(self, opponent):
         dx = opponent.x - self.x
         dy = opponent.y - self.y
@@ -190,6 +220,14 @@ class Character:
             self.knocked_out = True
             self.facing_when_ko = self.facing_direction
 
+        if self.arm_lock_left > 0:
+            self.arm_lock_left -= 1
+        if self.arm_lock_right > 0:
+            self.arm_lock_right -= 1
+        
+        if self.counter_window > 0:
+            self.counter_window -= 1
+
     def attempt_dodge(self, move_vec):
         c = self.cfg
         if self.energy >= c.DODGE_COST and self.dodge_cd == 0:
@@ -207,10 +245,14 @@ class Character:
             return True
         return False
 
-    def attempt_punch(self, kind: str):
+    # ============================================================
+    # Punch / Arms
+    # ============================================================
+    def attempt_punch(self, kind: str, preferred_arm: str | None = None) -> tuple[bool, str | None]:
         c = self.cfg
+
         if self.punch_cd != 0:
-            return False
+            return (False, None)
 
         if kind == "short":
             cost, cd, arm_len = c.COST_SHORT, c.CD_SHORT, c.ARM_SHORT
@@ -220,21 +262,63 @@ class Character:
             cost, cd, arm_len = c.COST_LONG, c.CD_LONG, c.ARM_LONG
 
         if self.energy < cost:
-            return False
+            return (False, None)
 
+        # evita overlapping de animações (mantém simples e previsível)
+        if self.punch_timer_left > 0 or self.punch_timer_right > 0:
+            return (False, None)
+
+        # braços disponíveis (não travados)
+        available: list[str] = []
+        if self.arm_lock_left == 0:
+            available.append("left")
+        if self.arm_lock_right == 0:
+            available.append("right")
+
+        if not available:
+            return (False, None)
+
+        if preferred_arm is not None:
+            if preferred_arm not in available:
+                return (False, None)
+            arm = preferred_arm
+        else:
+            arm = random.choice(available)
+
+        # só agora cobra energia/cd
         self.energy -= cost
         self.punch_cd = cd
 
-        if self.punch_timer_left == 0 and self.punch_timer_right == 0:
-            if random.random() < 0.5:
-                self.arm_len_left = arm_len
-                self.punch_timer_left = c.PUNCH_FRAMES
-            else:
-                self.arm_len_right = arm_len
-                self.punch_timer_right = c.PUNCH_FRAMES
-            return True
+        if arm == "left":
+            self.arm_len_left = arm_len
+            self.punch_timer_left = c.PUNCH_FRAMES
+        else:
+            self.arm_len_right = arm_len
+            self.punch_timer_right = c.PUNCH_FRAMES
 
-        return False
+        return (True, arm)
+
+    def cancel_punch_arm(self, arm: str) -> None:
+        c = self.cfg
+        if arm == "left":
+            self.punch_timer_left = 0
+            self.arm_len_left = float(c.ARM_RETRACT)
+        else:
+            self.punch_timer_right = 0
+            self.arm_len_right = float(c.ARM_RETRACT)
+
+
+    def glove_forward_extra_px(self) -> float:
+        """
+        Quanto a luva avança para a frente além do fim do braço:
+        push + (pivô -> ponta da luva).
+        """
+        img = self.glove_left_img  # já escalada
+        _w, h = img.get_size()
+        pivot_y = float(self.cfg.GLOVE_PIVOT_Y_FRAC) * float(h)
+        tip_from_pivot = (0.5 * float(h)) - pivot_y
+        tip_from_pivot = max(0.0, tip_from_pivot)
+        return float(self.cfg.GLOVE_FORWARD_PUSH_PX) + tip_from_pivot
 
     def get_arm_segments(self):
         left_shoulder_angle = self.facing_direction + math.pi / 4
@@ -280,6 +364,9 @@ class Character:
         self.punch_timer_left = 0
         self.punch_timer_right = 0
 
+        self.arm_lock_left = 0
+        self.arm_lock_right = 0
+
         self.trail_until_ms = 0
         self.trail_next_drop_ms = 0
         self.prev_x = self.x
@@ -289,12 +376,16 @@ class Character:
         self.round_lost = False
         self.facing_when_ko = self.facing_direction
 
+        self.counter_window = 0
+        self.arm_lock_left = 0
+        self.arm_lock_right = 0
+
     def start_trail(self, now_ms: int):
         self.trail_until_ms = now_ms + self.cfg.TRAIL_DURATION_MS
         self.trail_next_drop_ms = now_ms
         self.last_trail_drop_pos = (self.x, self.y)
 
-    def maybe_drop_trail(self, now_ms: int, decals_list: list, impact_imgs: list):
+    def maybe_drop_trail(self, now_ms: int, decals_list, impact_imgs: list):
         c = self.cfg
         if now_ms >= self.trail_until_ms:
             return
@@ -324,20 +415,34 @@ class Character:
         self.last_trail_drop_pos = (self.x, self.y)
         self.trail_next_drop_ms = now_ms + c.TRAIL_DROP_EVERY_MS
 
-    # ===== LUVAS =====
+    def lock_arm(self, arm: str, frames: int) -> None:
+        frames = max(0, int(frames))
+        if arm == "left":
+            self.arm_lock_left = max(self.arm_lock_left, frames)
+            self.arm_lock_right = 0  # nunca deixa os dois travados
+        else:
+            self.arm_lock_right = max(self.arm_lock_right, frames)
+            self.arm_lock_left = 0
+
+    # ============================================================
+    # Rotation cache
+    # ============================================================
     def _quant_angle(self, angle_deg: float) -> int:
         step = max(1, int(self.cfg.GLOVE_CACHE_STEP_DEG))
         return int(round(angle_deg / step) * step)
 
-    def _get_rotated_cached(self, img: pygame.Surface, angle_deg: float) -> pygame.Surface:
+    def _rot_cached(self, img: pygame.Surface, angle_deg: float) -> tuple[pygame.Surface, int]:
         qa = self._quant_angle(angle_deg)
         key = (id(img), qa)
-        r = self._glove_cache.get(key)
+        r = self._rot_cache.get(key)
         if r is None:
             r = pygame.transform.rotate(img, qa).convert_alpha()
-            self._glove_cache[key] = r
-        return r
+            self._rot_cache[key] = r
+        return r, qa
 
+    # ============================================================
+    # Draw
+    # ============================================================
     def draw(self, surface):
         if self.life <= 0:
             img = self.ko_image
@@ -347,7 +452,7 @@ class Character:
             ang = self.facing_direction
 
         angle_deg = -math.degrees(ang) + 90
-        rotated = pygame.transform.rotate(img, angle_deg)
+        rotated, _qa = self._rot_cached(img, angle_deg)
         rect = rotated.get_rect(center=(self.x, self.y))
         surface.blit(rotated, rect)
 
@@ -359,9 +464,6 @@ class Character:
     def draw_arms(self, surface):
         c = self.cfg
         (lsx, lsy, lex, ley), (rsx, rsy, rex, rey) = self.get_arm_segments()
-
-        #pygame.draw.line(surface, self.arm_color, (lsx, lsy), (lex, ley), self.arm_width)
-        #pygame.draw.line(surface, self.arm_color, (rsx, rsy), (rex, rey), self.arm_width)
 
         glove_angle = -math.degrees(self.facing_direction) + c.GLOVE_BASE_ROT_DEG
 
@@ -376,14 +478,12 @@ class Character:
         pivotL = (c.GLOVE_PIVOT_X_FRAC * lw, c.GLOVE_PIVOT_Y_FRAC * lh)
         pivotR = (c.GLOVE_PIVOT_X_FRAC * rw, c.GLOVE_PIVOT_Y_FRAC * rh)
 
-        qa = self._quant_angle(glove_angle)
-
-        rotL = self._get_rotated_cached(self.glove_left_img, glove_angle)
-        pvxL, pvyL = rotate_vec(pivotL[0], pivotL[1], qa)
+        rotL, qaL = self._rot_cached(self.glove_left_img, glove_angle)
+        pvxL, pvyL = rotate_vec(pivotL[0], pivotL[1], qaL)
         rectL = rotL.get_rect(center=(int(handL[0] - pvxL), int(handL[1] - pvyL)))
         surface.blit(rotL, rectL)
 
-        rotR = self._get_rotated_cached(self.glove_right_img, glove_angle)
-        pvxR, pvyR = rotate_vec(pivotR[0], pivotR[1], qa)
+        rotR, qaR = self._rot_cached(self.glove_right_img, glove_angle)
+        pvxR, pvyR = rotate_vec(pivotR[0], pivotR[1], qaR)
         rectR = rotR.get_rect(center=(int(handR[0] - pvxR), int(handR[1] - pvyR)))
         surface.blit(rotR, rectR)

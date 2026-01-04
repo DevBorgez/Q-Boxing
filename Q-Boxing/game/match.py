@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 import random
+from collections import deque
 from dataclasses import dataclass
 
 import pygame
@@ -18,6 +19,17 @@ class Fonts:
     small: pygame.font.Font
     big: pygame.font.Font
     super: pygame.font.Font
+
+
+@dataclass
+class _PunchIntent:
+    actor: Character
+    target: Character
+    action_name: str
+    started: bool
+    arm: str | None
+    contact_t: float  # smaller => likely to land first
+    canceled: bool = False
 
 
 class Game:
@@ -61,7 +73,7 @@ class Game:
         self.last_second_tick = now
         self.round_start_ms = now
 
-        self.ground_decals: list[GroundDecal] = []
+        self.ground_decals: deque[GroundDecal] = deque()
         self.max_distance_allowance = 260.0
         self.super_punch_until_ms = 0
 
@@ -69,10 +81,6 @@ class Game:
     # Early victory (vitória matemática)
     # ============================================================
     def _check_early_victory(self) -> bool:
-        """
-        Se um lado já tem uma vantagem que o outro não consegue mais alcançar
-        nem vencendo todos os rounds restantes, o jogo termina na hora.
-        """
         rounds_left = self.cfg.MAX_ROUNDS - self.rounds_played
         if self.red_score > self.blue_score + rounds_left:
             self.game_over = True
@@ -115,25 +123,58 @@ class Game:
             defender.knocked_out = True
             defender.facing_when_ko = defender.facing_direction
 
-        if len(self.ground_decals) > self.cfg.MAX_DECALS:
-            del self.ground_decals[:len(self.ground_decals) - self.cfg.MAX_DECALS]
+        while len(self.ground_decals) > self.cfg.MAX_DECALS:
+            self.ground_decals.popleft()
 
     # ============================================================
     # Reward / Engage
     # ============================================================
     @staticmethod
     def _in_punch_action(action_name: str) -> bool:
-        return action_name in ("punch_short", "punch_medium", "punch_long")
+        return action_name.startswith("punch_")
 
-    def _compute_reward(self, self_char: Character, opp_char: Character,
-                        action_name: str,
-                        dmg_dealt: float, dmg_taken: float,
-                        dist_before: float, dist_after: float,
-                        time_left: int) -> float:
+    @staticmethod
+    def _parse_punch_action(action_name: str) -> tuple[str, str] | None:
+        """Return (kind, arm) where arm is 'left'/'right'."""
+        if action_name.startswith("punch_short_"):
+            kind = "short"
+        elif action_name.startswith("punch_medium_"):
+            kind = "medium"
+        elif action_name.startswith("punch_long_"):
+            kind = "long"
+        else:
+            return None
+
+        if action_name.endswith("_L"):
+            arm = "left"
+        elif action_name.endswith("_R"):
+            arm = "right"
+        else:
+            return None
+        return (kind, arm)
+
+    def _compute_reward(
+        self,
+        self_char: Character,
+        opp_char: Character,
+        action_name: str,
+        dmg_dealt: float,
+        dmg_taken: float,
+        dist_before: float,
+        dist_after: float,
+        time_left: int,
+        did_counter: bool,
+        got_countered: bool,
+    ) -> float:
         c = self.cfg
         r = c.R_BASE
         r += c.R_DAMAGE * dmg_dealt
         r -= c.R_TAKEN * dmg_taken
+
+        if did_counter:
+            r += c.R_COUNTER
+        if got_countered:
+            r += c.R_COUNTERED
 
         if dist_before > 210:
             r += c.R_CLOSE * max(0.0, dist_before - dist_after)
@@ -141,13 +182,17 @@ class Game:
         if dist_before > c.ENGAGE_DIST:
             r += c.R_FAR_STEP
 
-        if self._in_punch_action(action_name) and dmg_dealt <= 0.0 and dist_before > c.ARM_LONG + self_char.radius:
-            r += c.R_FAR_PUNCH_MISS
+        punch_info = self._parse_punch_action(action_name)
+        if punch_info is not None and dmg_dealt <= 0.0:
+            kind, _arm = punch_info
+            max_len = self._punch_max_len(kind)
+            if dist_before > max_len + self_char.radius:
+                r += c.R_FAR_PUNCH_MISS
 
         if action_name == "do_nothing" and dist_before > 250 and self_char.energy > 35:
             r += c.R_IDLE_FAR
 
-        if self_char.energy < 15 and action_name in ("punch_long", "dodge", "punch_medium"):
+        if self_char.energy < 15 and (action_name.startswith("punch_long_") or action_name == "dodge" or action_name.startswith("punch_medium_")):
             r += c.R_LOW_ENERGY_WASTE
 
         if time_left <= 10 and dist_before > self.max_distance_allowance:
@@ -176,6 +221,97 @@ class Game:
         return (nx * f * scale, ny * f * scale)
 
     # ============================================================
+    # Punch alignment (ponta da luva não atravessa o corpo)
+    # ============================================================
+    def _punch_max_len(self, kind: str) -> float:
+        c = self.cfg
+        if kind == "short":
+            return float(c.ARM_SHORT)
+        if kind == "medium":
+            return float(c.ARM_MED)
+        return float(c.ARM_LONG)
+
+    @staticmethod
+    def _ray_circle_first_intersection_t(
+        sx: float, sy: float,
+        fx: float, fy: float,
+        cx: float, cy: float,
+        R: float,
+    ) -> float | None:
+        """Interseção do raio P(t)=S + t*F com círculo (C, R). Retorna o menor t>=0."""
+        dx = sx - cx
+        dy = sy - cy
+
+        b = 2.0 * (dx * fx + dy * fy)
+        c = (dx * dx + dy * dy) - (R * R)
+
+        disc = b * b - 4.0 * c  # a=1
+        if disc < 0.0:
+            return None
+
+        sqrt_disc = math.sqrt(disc)
+        t1 = (-b - sqrt_disc) * 0.5
+        t2 = (-b + sqrt_disc) * 0.5
+
+        if t1 >= 0.0:
+            return t1
+        if t2 >= 0.0:
+            return t2
+        return None
+
+    def _glove_forward_extra_px(self, attacker: Character) -> float:
+        """push + (pivô -> ponta da luva)."""
+        try:
+            return float(attacker.glove_forward_extra_px())
+        except Exception:
+            return float(self.cfg.GLOVE_FORWARD_PUSH_PX)
+
+    def _start_punch_with_alignment(
+        self,
+        attacker: Character,
+        defender: Character,
+        action_name: str,
+    ) -> tuple[bool, str | None, float]:
+        """
+        Inicia o soco e, se iniciou, ajusta o comprimento do braço pra que a ponta da luva encoste no círculo do defensor.
+        Retorna (started, used_arm, contact_t_proxy).
+        """
+        punch = self._parse_punch_action(action_name)
+        if punch is None:
+            return (False, None, float("inf"))
+
+        kind, preferred_arm = punch
+        started, used_arm = attacker.attempt_punch(kind, preferred_arm=preferred_arm)
+        if not started or used_arm not in ("left", "right"):
+            return (False, None, float("inf"))
+
+        # base: ombro do braço usado
+        (lsx, lsy, _lex, _ley), (rsx, rsy, _rex, _rey) = attacker.get_arm_segments()
+        sx, sy = (lsx, lsy) if used_arm == "left" else (rsx, rsy)
+
+        fx = math.cos(attacker.facing_direction)
+        fy = math.sin(attacker.facing_direction)
+
+        hit_mult = getattr(self.cfg, "HIT_RADIUS_MULT", 0.92)
+        gap_px = getattr(self.cfg, "PUNCH_CONTACT_GAP_PX", 3.0)
+        glove_extra = self._glove_forward_extra_px(attacker)
+
+        R = (defender.radius * float(hit_mult)) + float(gap_px) + float(glove_extra)
+
+        t = self._ray_circle_first_intersection_t(sx, sy, fx, fy, defender.x, defender.y, R)
+
+        if t is not None:
+            max_len = self._punch_max_len(kind)
+            new_len = clamp(float(t), float(self.cfg.ARM_RETRACT), float(max_len))
+            if used_arm == "left":
+                attacker.arm_len_left = new_len
+            else:
+                attacker.arm_len_right = new_len
+            return (True, used_arm, float(t))
+
+        return (True, used_arm, float("inf"))
+
+    # ============================================================
     # Step (Q-learning)
     # ============================================================
     def _action_to_move(self, action_name: str) -> tuple[float, float]:
@@ -197,6 +333,48 @@ class Game:
                 my += random.choice([-1, 1]) * (c.SPEED * 0.18)
 
         return mx, my
+
+    def _arm_segment(self, ch: Character, arm: str) -> tuple[float, float, float, float]:
+        (lsx, lsy, lex, ley), (rsx, rsy, rex, rey) = ch.get_arm_segments()
+        return (lsx, lsy, lex, ley) if arm == "left" else (rsx, rsy, rex, rey)
+
+    def _try_punch_hit(
+        self,
+        attacker: Character,
+        defender: Character,
+        arm: str,
+        hit_mult: float,
+    ) -> tuple[bool, tuple[float, float]]:
+        if defender.dodge_timer > 0 and random.random() < self.cfg.DODGE_EVADE_PROB:
+            return (False, (0.0, 0.0))
+
+        sx, sy, ex, ey = self._arm_segment(attacker, arm)
+        hit = segment_circle_hit(sx, sy, ex, ey, defender.x, defender.y, defender.radius * hit_mult)
+        if not hit:
+            return (False, (0.0, 0.0))
+
+        hx, hy = closest_point_on_segment(sx, sy, ex, ey, defender.x, defender.y)
+        return (True, (hx, hy))
+
+    def _roll_punch_damage(self, attacker: Character, action_name: str, dist_ab: float, now_ms: int) -> float:
+        c = self.cfg
+        punch = self._parse_punch_action(action_name)
+        if punch is None:
+            return 0.0
+
+        kind, _arm = punch
+        if kind == "short":
+            dmg = real_random_damage(c, c.DMG_SHORT_MIN, c.DMG_SHORT_MAX, attacker.energy, dist_ab, c.IDEAL_DIST_SHORT)
+        elif kind == "medium":
+            dmg = real_random_damage(c, c.DMG_MED_MIN, c.DMG_MED_MAX, attacker.energy, dist_ab, c.IDEAL_DIST_MED)
+        else:
+            dmg = real_random_damage(c, c.DMG_LONG_MIN, c.DMG_LONG_MAX, attacker.energy, dist_ab, c.IDEAL_DIST_LONG)
+
+        if roll(c.SUPER_PUNCH_CHANCE):
+            dmg = secrets_uniform(c.SUPER_PUNCH_DMG_MIN, c.SUPER_PUNCH_DMG_MAX)
+            self.super_punch_until_ms = now_ms + c.SUPER_PUNCH_MSG_MS
+
+        return float(dmg)
 
     def resolve_step(self) -> bool:
         c = self.cfg
@@ -249,11 +427,16 @@ class Game:
         self.red.clamp_inside()
         self.blue.clamp_inside()
 
-        # circular collision
+        # ========================================================
+        # Colisão circular: aqui é onde você deixa eles menos colados
+        # ========================================================
         dx = self.blue.x - self.red.x
         dy = self.blue.y - self.red.y
         d = math.hypot(dx, dy)
-        min_d = (self.red.radius + self.blue.radius) * 0.98
+
+        body_gap = float(getattr(self.cfg, "BODY_GAP_PX", 14.0))
+        min_d = (self.red.radius + self.blue.radius) + body_gap
+
         if d < min_d and d > 1e-6:
             push = (min_d - d) * 0.5
             nx = dx / d
@@ -265,82 +448,77 @@ class Game:
             self.red.clamp_inside()
             self.blue.clamp_inside()
 
-        # punches
-        red_punch_started = False
-        blue_punch_started = False
-        if act_red == "punch_short":
-            red_punch_started = self.red.attempt_punch("short")
-        elif act_red == "punch_medium":
-            red_punch_started = self.red.attempt_punch("medium")
-        elif act_red == "punch_long":
-            red_punch_started = self.red.attempt_punch("long")
+        # ========================================================
+        # Punch start + alinhamento da ponta da luva (sem atravessar)
+        # ========================================================
+        red_started, red_arm, red_t = self._start_punch_with_alignment(self.red, self.blue, act_red)
+        blue_started, blue_arm, blue_t = self._start_punch_with_alignment(self.blue, self.red, act_blue)
 
-        if act_blue == "punch_short":
-            blue_punch_started = self.blue.attempt_punch("short")
-        elif act_blue == "punch_medium":
-            blue_punch_started = self.blue.attempt_punch("medium")
-        elif act_blue == "punch_long":
-            blue_punch_started = self.blue.attempt_punch("long")
+        red_intent = _PunchIntent(self.red, self.blue, act_red, red_started, red_arm, red_t)
+        blue_intent = _PunchIntent(self.blue, self.red, act_blue, blue_started, blue_arm, blue_t)
 
         dmg_red = 0.0
         dmg_blue = 0.0
+        did_counter_red = False
+        did_counter_blue = False
+        got_countered_red = False
+        got_countered_blue = False
 
         red_life_before = self.red.life
         blue_life_before = self.blue.life
 
-        if self.red.life > 0 and self.blue.life > 0:
-            # RED -> BLUE
-            if red_punch_started:
-                (lsx, lsy, lex, ley), (rsx, rsy, rex, rey) = self.red.get_arm_segments()
-                if not (self.blue.dodge_timer > 0 and random.random() < c.DODGE_EVADE_PROB):
-                    hit_l = segment_circle_hit(lsx, lsy, lex, ley, self.blue.x, self.blue.y, self.blue.radius * 0.92)
-                    hit_r = segment_circle_hit(rsx, rsy, rex, rey, self.blue.x, self.blue.y, self.blue.radius * 0.92)
-                    if hit_l or hit_r:
-                        dist_rb = math.hypot(self.red.x - self.blue.x, self.red.y - self.blue.y)
+        hit_mult = getattr(self.cfg, "HIT_RADIUS_MULT", 0.92)
 
-                        if act_red == "punch_short":
-                            dmg_red = real_random_damage(c, c.DMG_SHORT_MIN, c.DMG_SHORT_MAX, self.red.energy, dist_rb, c.IDEAL_DIST_SHORT)
-                        elif act_red == "punch_medium":
-                            dmg_red = real_random_damage(c, c.DMG_MED_MIN, c.DMG_MED_MAX, self.red.energy, dist_rb, c.IDEAL_DIST_MED)
-                        else:
-                            dmg_red = real_random_damage(c, c.DMG_LONG_MIN, c.DMG_LONG_MAX, self.red.energy, dist_rb, c.IDEAL_DIST_LONG)
+        # Resolve punches in "initiative" order (closest contact first).
+        intents = sorted([red_intent, blue_intent], key=lambda p: p.contact_t)
 
-                        if roll(c.SUPER_PUNCH_CHANCE):
-                            dmg_red = secrets_uniform(c.SUPER_PUNCH_DMG_MIN, c.SUPER_PUNCH_DMG_MAX)
-                            self.super_punch_until_ms = now + c.SUPER_PUNCH_MSG_MS
+        same_side = (
+            red_intent.started and blue_intent.started and
+            red_intent.arm is not None and
+            red_intent.arm == blue_intent.arm
+        )
 
-                        if hit_l:
-                            hx, hy = closest_point_on_segment(lsx, lsy, lex, ley, self.blue.x, self.blue.y)
-                        else:
-                            hx, hy = closest_point_on_segment(rsx, rsy, rex, rey, self.blue.x, self.blue.y)
-                        self._apply_damage(self.red, self.blue, dmg_red, (hx, hy))
+        for i, p in enumerate(intents):
+            if p.canceled:
+                continue
+            if p.actor.life <= 0 or p.target.life <= 0:
+                continue
+            if not p.started or p.arm not in ("left", "right"):
+                continue
 
-            # BLUE -> RED
-            if blue_punch_started:
-                (lsx, lsy, lex, ley), (rsx, rsy, rex, rey) = self.blue.get_arm_segments()
-                if not (self.red.dodge_timer > 0 and random.random() < c.DODGE_EVADE_PROB):
-                    hit_l = segment_circle_hit(lsx, lsy, lex, ley, self.red.x, self.red.y, self.red.radius * 0.92)
-                    hit_r = segment_circle_hit(rsx, rsy, rex, rey, self.red.x, self.red.y, self.red.radius * 0.92)
-                    if hit_l or hit_r:
-                        dist_rb = math.hypot(self.red.x - self.blue.x, self.red.y - self.blue.y)
+            hit, hit_pos = self._try_punch_hit(p.actor, p.target, p.arm, float(hit_mult))
+            if not hit:
+                continue
 
-                        if act_blue == "punch_short":
-                            dmg_blue = real_random_damage(c, c.DMG_SHORT_MIN, c.DMG_SHORT_MAX, self.blue.energy, dist_rb, c.IDEAL_DIST_SHORT)
-                        elif act_blue == "punch_medium":
-                            dmg_blue = real_random_damage(c, c.DMG_MED_MIN, c.DMG_MED_MAX, self.blue.energy, dist_rb, c.IDEAL_DIST_MED)
-                        else:
-                            dmg_blue = real_random_damage(c, c.DMG_LONG_MIN, c.DMG_LONG_MAX, self.blue.energy, dist_rb, c.IDEAL_DIST_LONG)
+            dist_ab = math.hypot(p.actor.x - p.target.x, p.actor.y - p.target.y)
+            dmg = self._roll_punch_damage(p.actor, p.action_name, dist_ab, now)
 
-                        if roll(c.SUPER_PUNCH_CHANCE):
-                            dmg_blue = secrets_uniform(c.SUPER_PUNCH_DMG_MIN, c.SUPER_PUNCH_DMG_MAX)
-                            self.super_punch_until_ms = now + c.SUPER_PUNCH_MSG_MS
+            # "same-side vulnerability": if both started with same arm, first landed hit cancels the other
+            if same_side and i == 0:
+                other = intents[1]
+                if other.started and other.arm == p.arm and not other.canceled:
+                    dmg *= (1.0 + float(c.COUNTER_DAMAGE_BONUS))
 
-                        if hit_l:
-                            hx, hy = closest_point_on_segment(lsx, lsy, lex, ley, self.red.x, self.red.y)
-                        else:
-                            hx, hy = closest_point_on_segment(rsx, rsy, rex, rey, self.red.x, self.red.y)
-                        self._apply_damage(self.blue, self.red, dmg_blue, (hx, hy))
+                    # cancel the other punch animation and lock its arm
+                    other.actor.cancel_punch_arm(other.arm)
+                    other.actor.lock_arm(other.arm, int(c.COUNTER_ARM_LOCK_FRAMES))
+                    other.canceled = True
 
+                    if p.actor is self.red:
+                        did_counter_red = True
+                        got_countered_blue = True
+                    else:
+                        did_counter_blue = True
+                        got_countered_red = True
+
+            self._apply_damage(p.actor, p.target, dmg, hit_pos)
+
+            if p.actor is self.red:
+                dmg_red += dmg
+            else:
+                dmg_blue += dmg
+
+        # FX trail
         now2 = pygame.time.get_ticks()
         self.red.maybe_drop_trail(now2, self.ground_decals, self.red.impacts)
         self.blue.maybe_drop_trail(now2, self.ground_decals, self.blue.impacts)
@@ -360,8 +538,16 @@ class Game:
         self.red.tick_timers()
         self.blue.tick_timers()
 
-        r_red = self._compute_reward(self.red, self.blue, act_red, dmg_red, dmg_taken_red, dist_before, dist_after, self.time_left)
-        r_blue = self._compute_reward(self.blue, self.red, act_blue, dmg_blue, dmg_taken_blue, dist_before, dist_after, self.time_left)
+        r_red = self._compute_reward(
+            self.red, self.blue, act_red,
+            dmg_red, dmg_taken_red, dist_before, dist_after, self.time_left,
+            did_counter_red, got_countered_red,
+        )
+        r_blue = self._compute_reward(
+            self.blue, self.red, act_blue,
+            dmg_blue, dmg_taken_blue, dist_before, dist_after, self.time_left,
+            did_counter_blue, got_countered_blue,
+        )
 
         done = False
         if self.red.life <= 0 or self.blue.life <= 0:
@@ -413,11 +599,8 @@ class Game:
             self.blue_score += 1
 
         self.rounds_played += 1
-
-        # vitória matemática (instantânea)
         if self._check_early_victory():
             return
-
         if self.rounds_played >= self.cfg.MAX_ROUNDS:
             self.game_over = True
 
@@ -437,11 +620,8 @@ class Game:
             self.blue.round_lost = True
 
         self.rounds_played += 1
-
-        # vitória matemática (instantânea)
         if self._check_early_victory():
             return
-
         if self.rounds_played >= self.cfg.MAX_ROUNDS:
             self.game_over = True
 
@@ -458,7 +638,6 @@ class Game:
         if self.game_over or self.round_over:
             return
 
-        # mais robusto se houver “travada” de FPS: consome segundos acumulados
         while now - self.last_second_tick >= 1000:
             self.last_second_tick += 1000
             self.time_left -= 1
@@ -470,7 +649,10 @@ class Game:
     def render(self, now: int):
         self.screen.fill(self.cfg.BG)
 
-        self.ground_decals = [d for d in self.ground_decals if d.alive(now)]
+        # remove expired decals cheaply (oldest first)
+        while self.ground_decals and (not self.ground_decals[0].alive(now)):
+            self.ground_decals.popleft()
+
         for d in self.ground_decals:
             d.draw(self.screen, now)
 
