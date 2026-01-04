@@ -310,10 +310,10 @@ class Character:
 
     def glove_forward_extra_px(self) -> float:
         """
-        Quanto a luva avança para a frente além do fim do braço:
-        push + (pivô -> ponta da luva).
+        As glove advances forward beyond the end of the arm: 
+        push + (pivot -> tip of glove).
         """
-        img = self.glove_left_img  # já escalada
+        img = self.glove_left_img
         _w, h = img.get_size()
         pivot_y = float(self.cfg.GLOVE_PIVOT_Y_FRAC) * float(h)
         tip_from_pivot = (0.5 * float(h)) - pivot_y
@@ -419,7 +419,7 @@ class Character:
         frames = max(0, int(frames))
         if arm == "left":
             self.arm_lock_left = max(self.arm_lock_left, frames)
-            self.arm_lock_right = 0  # nunca deixa os dois travados
+            self.arm_lock_right = 0
         else:
             self.arm_lock_right = max(self.arm_lock_right, frames)
             self.arm_lock_left = 0
