@@ -285,7 +285,6 @@ class Character:
         else:
             arm = random.choice(available)
 
-        # só agora cobra energia/cd
         self.energy -= cost
         self.punch_cd = cd
 
@@ -487,3 +486,4 @@ class Character:
         pvxR, pvyR = rotate_vec(pivotR[0], pivotR[1], qaR)
         rectR = rotR.get_rect(center=(int(handR[0] - pvxR), int(handR[1] - pvyR)))
         surface.blit(rotR, rectR)
+
