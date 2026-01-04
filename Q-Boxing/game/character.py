@@ -69,7 +69,7 @@ class Character:
         self.dodge_cd = 0
         self.dodge_timer = 0
 
-        # áudio/fx
+        # audio/fx
         self.sound_cd = 0
         self.impacts = impacts
         self.snd_light = snd_light
@@ -486,4 +486,5 @@ class Character:
         pvxR, pvyR = rotate_vec(pivotR[0], pivotR[1], qaR)
         rectR = rotR.get_rect(center=(int(handR[0] - pvxR), int(handR[1] - pvyR)))
         surface.blit(rotR, rectR)
+
 
