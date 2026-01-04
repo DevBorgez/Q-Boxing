@@ -78,7 +78,7 @@ class Game:
         self.super_punch_until_ms = 0
 
     # ============================================================
-    # Early victory (vitória matemática)
+    # Early victory
     # ============================================================
     def _check_early_victory(self) -> bool:
         rounds_left = self.cfg.MAX_ROUNDS - self.rounds_played
@@ -428,7 +428,7 @@ class Game:
         self.blue.clamp_inside()
 
         # ========================================================
-        # Colisão circular: aqui é onde você deixa eles menos colados
+        # Circular collision
         # ========================================================
         dx = self.blue.x - self.red.x
         dy = self.blue.y - self.red.y
@@ -449,7 +449,7 @@ class Game:
             self.blue.clamp_inside()
 
         # ========================================================
-        # Punch start + alinhamento da ponta da luva (sem atravessar)
+        # Punch start
         # ========================================================
         red_started, red_arm, red_t = self._start_punch_with_alignment(self.red, self.blue, act_red)
         blue_started, blue_arm, blue_t = self._start_punch_with_alignment(self.blue, self.red, act_blue)
@@ -526,7 +526,7 @@ class Game:
         dmg_taken_red = max(0.0, red_life_before - self.red.life)
         dmg_taken_blue = max(0.0, blue_life_before - self.blue.life)
 
-        # regen energia
+        # regen energy
         red_moved = (rmx != 0.0 or rmy != 0.0) or (self.red.dodge_timer > 0) or (abs(erx) + abs(ery) > 0)
         blue_moved = (bmx != 0.0 or bmy != 0.0) or (self.blue.dodge_timer > 0) or (abs(ebx) + abs(eby) > 0)
 
@@ -704,3 +704,4 @@ class Game:
                         self._reset_round(now)
 
             self.render(now)
+
