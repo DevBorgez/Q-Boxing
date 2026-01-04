@@ -66,6 +66,23 @@ class Game:
         self.super_punch_until_ms = 0
 
     # ============================================================
+    # Early victory (vitória matemática)
+    # ============================================================
+    def _check_early_victory(self) -> bool:
+        """
+        Se um lado já tem uma vantagem que o outro não consegue mais alcançar
+        nem vencendo todos os rounds restantes, o jogo termina na hora.
+        """
+        rounds_left = self.cfg.MAX_ROUNDS - self.rounds_played
+        if self.red_score > self.blue_score + rounds_left:
+            self.game_over = True
+            return True
+        if self.blue_score > self.red_score + rounds_left:
+            self.game_over = True
+            return True
+        return False
+
+    # ============================================================
     # Audio / Damage
     # ============================================================
     def _play_hit_sound(self, attacker: Character, damage: float):
@@ -207,9 +224,15 @@ class Game:
         bmx, bmy = self._action_to_move(act_blue)
 
         if act_red == "dodge":
-            self.red.attempt_dodge((math.cos(self.red.facing_direction + math.pi / 2), math.sin(self.red.facing_direction + math.pi / 2)))
+            self.red.attempt_dodge((
+                math.cos(self.red.facing_direction + math.pi / 2),
+                math.sin(self.red.facing_direction + math.pi / 2),
+            ))
         if act_blue == "dodge":
-            self.blue.attempt_dodge((math.cos(self.blue.facing_direction - math.pi / 2), math.sin(self.blue.facing_direction - math.pi / 2)))
+            self.blue.attempt_dodge((
+                math.cos(self.blue.facing_direction - math.pi / 2),
+                math.sin(self.blue.facing_direction - math.pi / 2),
+            ))
 
         now = pygame.time.get_ticks()
         erx, ery = self._engagement_force(self.red, self.blue, now)
@@ -390,6 +413,11 @@ class Game:
             self.blue_score += 1
 
         self.rounds_played += 1
+
+        # vitória matemática (instantânea)
+        if self._check_early_victory():
+            return
+
         if self.rounds_played >= self.cfg.MAX_ROUNDS:
             self.game_over = True
 
@@ -409,6 +437,11 @@ class Game:
             self.blue.round_lost = True
 
         self.rounds_played += 1
+
+        # vitória matemática (instantânea)
+        if self._check_early_victory():
+            return
+
         if self.rounds_played >= self.cfg.MAX_ROUNDS:
             self.game_over = True
 
@@ -424,12 +457,15 @@ class Game:
     def _update_clock(self, now: int):
         if self.game_over or self.round_over:
             return
-        if now - self.last_second_tick >= 1000:
+
+        # mais robusto se houver “travada” de FPS: consome segundos acumulados
+        while now - self.last_second_tick >= 1000:
             self.last_second_tick += 1000
             self.time_left -= 1
             if self.time_left <= 0:
                 self.time_left = 0
                 self._end_round_by_time(now)
+                break
 
     def render(self, now: int):
         self.screen.fill(self.cfg.BG)
