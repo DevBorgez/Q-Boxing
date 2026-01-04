@@ -5,7 +5,7 @@ import pygame
 from dotenv import load_dotenv
 
 from config import CFG
-from assets.loader import load_assets
+from assets.python_files.loader import load_assets
 from game.match import Game, Fonts
 
 def main():
